@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     FLASK_ENV: str = "development"
     JWT_SECRET_KEY: str = "jwt-change-me-in-production"
     JWT_ACCESS_TOKEN_EXPIRES_MINUTES: int = 60
-    UPLOAD_FOLDER: str = "/uploads"
+    UPLOAD_FOLDER: str = "/tmp/uploads"
     MAX_CONTENT_LENGTH_MB: int = 5
     ALLOWED_EXTENSIONS: ClassVar[set[str]] = {"png", "jpg", "jpeg", "gif", "webp"}
 

@@ -13,12 +13,12 @@ export const getEmployees = async (
 ): Promise<EmployeeListResponse> => {
   const params: Record<string, unknown> = { page, per_page: perPage };
   if (search) params.search = search;
-  const { data } = await apiClient.get<EmployeeListResponse>('/', { params });
+  const { data } = await apiClient.get<EmployeeListResponse>('/employees', { params });
   return data;
 };
 
 export const getEmployee = async (id: number): Promise<Employee> => {
-  const { data } = await apiClient.get<Employee>(`/${id}`);
+  const { data } = await apiClient.get<Employee>(`/employees/${id}`);
   return data;
 };
 
