@@ -1,12 +1,8 @@
 # AGENTS.md — Coding Agent Guidelines
 
-This is a corporate employee directory application built with:
-- **Backend:** Python / Flask
-- **Frontend:** React.js
-- **Database:** PostgreSQL
-- **Infrastructure:** Docker Compose
+Corporate employee directory app: **Flask** backend, **React/TypeScript** frontend, **PostgreSQL** database, **Docker Compose** infrastructure.
 
-No existing cursor rules, copilot instructions, or prior AGENTS.md were found; these conventions are established for greenfield development.
+No Cursor rules, Copilot instructions, or `.editorconfig` are present in this repo.
 
 ---
 
@@ -14,24 +10,29 @@ No existing cursor rules, copilot instructions, or prior AGENTS.md were found; t
 
 ```
 task-1-flask-project/
-├── backend/               # Flask application
+├── backend/
 │   ├── app/
-│   │   ├── __init__.py    # App factory (create_app)
-│   │   ├── models/        # SQLAlchemy models
-│   │   ├── routes/        # Blueprint route handlers
-│   │   ├── schemas/       # Marshmallow / Pydantic schemas
-│   │   ├── services/      # Business logic layer
-│   │   └── utils/         # Shared helpers
-│   ├── tests/
+│   │   ├── __init__.py        # App factory: create_app, extension init
+│   │   ├── config.py          # pydantic-settings Settings class
+│   │   ├── models/            # SQLAlchemy 2.x models (one per file)
+│   │   ├── routes/            # Flask Blueprint handlers + errors.py
+│   │   ├── schemas/           # Pydantic request/response schemas
+│   │   ├── services/          # Business logic + exceptions.py
+│   │   └── utils/             # Shared helpers
+│   ├── migrations/            # Alembic migration files
+│   ├── tests/                 # pytest test suite
 │   ├── requirements.txt
-│   └── pyproject.toml
-├── frontend/              # React application (Vite + TypeScript)
+│   └── pyproject.toml         # ruff, mypy, pytest, coverage config
+├── frontend/
 │   ├── src/
-│   │   ├── components/
-│   │   ├── pages/
-│   │   ├── api/           # API client / hooks
-│   │   └── types/
-│   ├── package.json
+│   │   ├── api/               # Axios client + per-resource modules
+│   │   ├── components/        # Reusable React components
+│   │   ├── contexts/
+│   │   ├── hooks/             # Custom React hooks
+│   │   ├── pages/             # Route-level page components
+│   │   └── types/             # Shared TypeScript interfaces
+│   ├── eslint.config.js       # ESLint v9 flat config
+│   ├── tsconfig.app.json      # Strict TS settings (target: es2023)
 │   └── vite.config.ts
 ├── docker-compose.yml
 └── AGENTS.md
@@ -49,25 +50,27 @@ docker compose down                # stop and remove containers
 docker compose logs -f backend     # tail backend logs
 ```
 
-### Backend (Flask)
+### Backend (Flask — Python 3.12)
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-flask db upgrade                   # apply migrations
-flask run --debug                  # development server (port 5000)
+flask db upgrade                   # apply Alembic migrations
+flask run --debug                  # dev server on port 5000
 ```
 
-### Frontend (React)
+### Frontend (React + Vite)
 ```bash
 cd frontend
 npm install
-npm run dev                        # development server (port 5173)
-npm run build                      # production build
+npm run dev                        # dev server on port 5173
+npm run build                      # tsc -b + vite build (production)
 npm run lint                       # ESLint check
-npm run type-check                 # tsc --noEmit
+npm run preview                    # serve the production build locally
 ```
+
+> **Note:** There is no frontend test runner configured yet (Vitest is not installed).
+> `npm run type-check` is not a defined script — use `npm run build` to get tsc errors.
 
 ---
 
@@ -76,31 +79,25 @@ npm run type-check                 # tsc --noEmit
 ### Backend (pytest)
 ```bash
 cd backend
-pytest                             # run all tests
-pytest tests/test_auth.py          # run a single test file
-pytest tests/test_auth.py::test_login_success  # run a single test
-pytest -x                          # stop at first failure
-pytest -v                          # verbose output
-pytest --cov=app --cov-report=term-missing  # with coverage
+pytest                                          # run all tests
+pytest tests/test_auth.py                       # single test file
+pytest tests/test_auth.py::test_login_success   # single test function
+pytest -x                                       # stop at first failure
+pytest -v                                       # verbose (default via addopts)
+pytest --cov=app --cov-report=term-missing      # with coverage
 ```
 
-### Frontend (Vitest)
+### Linting and Type Checking
 ```bash
-cd frontend
-npm test                           # run all tests (watch mode)
-npm run test:run                   # run all tests once (CI)
-npm run test -- src/components/EmployeeCard.test.tsx  # single file
-```
-
-### Linting
-```bash
+# Backend
 cd backend
-ruff check .                       # Python linting (preferred over flake8)
-ruff format --check .              # Python formatting check
+ruff check .                       # lint (preferred over flake8)
+ruff format --check .              # formatting check
 mypy app/                          # type checking
 
+# Frontend
 cd frontend
-npm run lint                       # ESLint
+npm run lint                       # ESLint (v9 flat config)
 ```
 
 ---
@@ -108,27 +105,29 @@ npm run lint                       # ESLint
 ## Python / Flask Code Style
 
 ### Formatting and Linting
-- Use **Ruff** for linting and formatting (`ruff check`, `ruff format`).
-- Line length: **88** characters (Black-compatible default).
-- Target Python **3.11+**.
+- **Ruff** handles both linting and formatting (`ruff check`, `ruff format`).
+- Line length: **88** characters (Black-compatible).
+- Target: **Python 3.12**. Enabled rule sets: `E`, `F`, `I` (isort), `UP`, `B`, `SIM`.
+- `from __future__ import annotations` at the top of **every** module.
 
 ### Imports
-- Group imports: stdlib → third-party → local. Separated by blank lines.
-- Use absolute imports within the `app` package; never relative imports across packages.
-- Import specific names rather than whole modules where practical.
-
 ```python
-# Good
+# stdlib → third-party → local, separated by blank lines
+from __future__ import annotations
+
 from flask import Blueprint, jsonify, request
+from flask_jwt_extended import jwt_required
+
 from app.models.user import User
-from app.services.auth import AuthService
+from app.services.employee_service import EmployeeService
 ```
+- Use **absolute imports** within `app`; never relative cross-package imports.
+- `known-first-party = ["app"]` is configured in pyproject.toml for isort.
 
 ### Type Hints
-- All function signatures must include type hints (parameters and return type).
-- Use `from __future__ import annotations` at the top of every module.
-- Use `Optional[X]` or `X | None` (prefer the latter on Python 3.10+).
-- Use `TypedDict` or dataclasses for structured data passed between layers.
+- All function signatures must have typed parameters **and** return types.
+- Prefer `X | None` over `Optional[X]`.
+- Use Pydantic models or `TypedDict` for structured data between layers.
 
 ```python
 from __future__ import annotations
@@ -139,99 +138,100 @@ def get_employee(employee_id: int) -> Employee | None:
 
 ### Naming Conventions
 | Construct | Convention | Example |
-|-----------|-----------|---------|
+|---|---|---|
 | Modules / files | `snake_case` | `employee_service.py` |
 | Classes | `PascalCase` | `EmployeeService` |
 | Functions / methods | `snake_case` | `get_employee_by_id` |
-| Variables | `snake_case` | `employee_list` |
 | Constants | `UPPER_SNAKE_CASE` | `MAX_PAGE_SIZE = 100` |
-| Flask Blueprints | `snake_case` variable, `kebab-case` URL prefix | `employees_bp`, `/employees` |
+| Flask Blueprints | `snake_case` var, `kebab-case` prefix | `employees_bp`, `/employees` |
 
 ### Error Handling
-- Use Flask error handlers registered on the app or blueprint, not bare `try/except` in routes.
-- Return JSON error responses consistently: `{"error": "message", "code": "ERROR_CODE"}`.
-- Raise domain-specific exceptions in the service layer; catch them in routes.
-- Never swallow exceptions silently — always log with `current_app.logger`.
+- All domain exceptions inherit from `AppError` (defined in `services/exceptions.py`) with `http_status` and `code` class attributes.
+- Raise exceptions in the **service layer**; never put business-logic `try/except` in routes.
+- All exceptions are caught by `register_error_handlers(app)` in `routes/errors.py`.
+- JSON error shape: `{"error": "<message>", "code": "<ERROR_CODE>"}`.
+- Never swallow exceptions silently — log with `current_app.logger`.
 
 ```python
-# Service layer
-class EmployeeNotFoundError(Exception):
-    pass
+# services/exceptions.py
+class NotFoundError(AppError):
+    http_status = 404
+    code = "NOT_FOUND"
 
-# Route layer
-@bp.errorhandler(EmployeeNotFoundError)
-def handle_not_found(e: EmployeeNotFoundError):
-    return jsonify({"error": str(e), "code": "NOT_FOUND"}), 404
+# routes/errors.py  (registered once on the app, not per blueprint)
+@app.errorhandler(AppError)
+def handle_app_error(e: AppError) -> tuple[Response, int]:
+    return jsonify({"error": str(e), "code": e.code}), e.http_status
 ```
 
-### Models (SQLAlchemy)
+### Models (SQLAlchemy 2.x)
 - One model per file under `app/models/`.
-- Define `__tablename__` explicitly.
-- Use `db.Mapped` / `mapped_column` (SQLAlchemy 2.x style).
-- Never put business logic in models — delegate to services.
+- Define `__tablename__` explicitly; use `db.Mapped` / `mapped_column`.
+- No business logic in models — delegate everything to services.
 
 ### API Design
-- REST conventions: nouns for resources, HTTP verbs for actions.
-- All endpoints return JSON; use 201 for creation, 204 for deletion.
-- Validate and deserialize request bodies with Marshmallow or Pydantic schemas before passing to services.
-- Paginate list endpoints; default page size: 20, max: 100.
+- REST conventions: noun resources, HTTP verbs for actions.
+- Return JSON always; use **201** for creation, **204** for deletion.
+- Validate request bodies with **Pydantic** schemas before passing to services.
+- Paginate list endpoints: default page size **20**, max **100**.
 
 ---
 
 ## React / TypeScript Code Style
 
-### Formatting
-- **Prettier** for formatting; **ESLint** with `eslint-config-airbnb-typescript` for linting.
-- Use **TypeScript** — no plain `.js` files in `src/`.
-- Avoid `any`; use proper types or `unknown` with runtime narrowing.
+### Tooling
+- **ESLint v9** (flat config in `eslint.config.js`) with `typescript-eslint`, `eslint-plugin-react-hooks`, `eslint-plugin-react-refresh`.
+- **TypeScript** strict settings: `noUnusedLocals`, `noUnusedParameters`, `verbatimModuleSyntax`.
+- No Prettier configured — formatting is not currently enforced by tooling.
+- No plain `.js` files in `src/`; no `any` — use proper types or `unknown` with narrowing.
 
 ### Components
-- One component per file; filename matches the component name (`EmployeeCard.tsx`).
-- Use **functional components** with hooks only; no class components.
-- Keep components small and focused; extract logic into custom hooks (`useEmployees`, `useAuth`).
-- Co-locate component-specific styles, tests, and types in the same directory.
+- One component per file; filename **must** match the component name (`EmployeeCard.tsx`).
+- **Functional components** with hooks only — no class components.
+- Keep components focused; extract reusable logic into custom hooks.
+- UI components use **Ant Design** (`antd`) — prefer its primitives over custom CSS.
 
 ### Naming Conventions
 | Construct | Convention | Example |
-|-----------|-----------|---------|
+|---|---|---|
 | Components | `PascalCase` | `EmployeeCard` |
 | Hooks | `camelCase` prefixed `use` | `useEmployee` |
-| Files (components) | `PascalCase.tsx` | `EmployeeCard.tsx` |
-| Files (utils/hooks) | `camelCase.ts` | `useEmployee.ts` |
-| CSS classes | `kebab-case` | `employee-card__avatar` |
+| Component files | `PascalCase.tsx` | `EmployeeCard.tsx` |
+| Hook / util files | `camelCase.ts` | `useEmployee.ts` |
 
 ### API Calls
-- Centralise all API calls under `src/api/`; never call `fetch`/`axios` directly in components.
-- Use **React Query** (`@tanstack/react-query`) for data fetching, caching, and mutation.
-- Type all API responses with interfaces in `src/types/`.
+- All HTTP calls go through the centralised **Axios instance** in `src/api/client.ts` (handles JWT attachment and 401 redirects).
+- Resource-specific functions live in `src/api/<resource>.ts` — **never** call axios directly in components.
+- Use **React Query** (`@tanstack/react-query`) for data fetching, caching, and mutations.
+- Type all API responses with interfaces in `src/types/index.ts`.
 
 ### Error Handling (Frontend)
-- Use React Query's `onError` / `isError` states for async errors.
-- Display user-facing error messages via a shared `<Toast>` / `<Alert>` component.
-- Never log sensitive user data to the console in production.
+- Use React Query's `isError` / `error` states for async error display.
+- Show user-facing messages via Ant Design `message` or `notification` utilities.
+- Never log sensitive data to the console in production builds.
 
 ---
 
 ## Database Conventions
 
-- Use **Flask-Migrate** (Alembic) for all schema changes; never mutate the schema manually.
-- Every migration must be reversible (implement `downgrade()`).
-- Use database-level constraints (NOT NULL, UNIQUE, FK) to enforce data integrity.
-- Store passwords hashed with `bcrypt`; never store plaintext credentials.
-- User-uploaded photos: store on disk / object storage; store only the path/URL in the DB.
+- Use **Flask-Migrate** (Alembic) for all schema changes — never alter the schema manually.
+- Every migration must implement a working `downgrade()`.
+- Enforce data integrity with DB-level constraints (NOT NULL, UNIQUE, FK).
+- Passwords hashed with **bcrypt** (`Flask-Bcrypt`) — never store plaintext.
+- Uploaded photos: store on disk/object storage; persist only the path/URL in the DB.
 
 ---
 
 ## Environment and Secrets
 
-- All secrets (DB URL, secret key, etc.) come from environment variables — never hardcoded.
-- Use a `.env` file locally (gitignored); document required variables in `.env.example`.
+- All secrets come from environment variables — never hardcoded.
+- Use a `.env` file locally (gitignored); keep `.env.example` up to date.
 - Required backend variables: `DATABASE_URL`, `SECRET_KEY`, `FLASK_ENV`.
 
 ---
 
 ## Git Conventions
 
-- Branch names: `feature/<short-description>`, `fix/<short-description>`.
-- Commit messages follow Conventional Commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`.
-- All tests must pass before merging to `main`.
+- Branch names: `feature/<short-description>` or `fix/<short-description>`.
+- Commit messages follow **Conventional Commits**: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`.
+- All backend tests must pass (`pytest`) before merging to `main`.
