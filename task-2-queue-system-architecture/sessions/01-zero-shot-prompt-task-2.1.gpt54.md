@@ -1,278 +1,324 @@
-# Distributed Task Processing System
+Ниже — практичный high-level дизайн распределённой системы обработки задач под требования:
 
-## 1. Анализ требований
-
-```
-50,000 RPS → ~4.3 млрд задач/день
-At-least-once → нужен acknowledgment + retry механизм  
-Latency < 100ms → P99, end-to-end
-Horizontal scaling → stateless workers + partitioned storage
-```
+- **50,000 RPS**
+- **гарантия доставки: at-least-once**
+- **latency <100ms**
+- **горизонтальное масштабирование**
 
 ---
 
-## 2. High-Level Architecture
+#1. Сначала уточним, что именно проектируемПод “система обработки задач” обычно понимают такой pipeline:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLIENTS│
-└──────────────────┬──────────────────────────────────────────┘│┌─────────▼─────────┐
-         │   API Gateway      │  ← Rate limiting, auth
-         │   (Nginx/Envoy)    │    10instances
-         └─────────┬─────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │      Intake Service│  ← Stateless, 20 instances
-    │   (Task Validation +│    Go/Rust для низкой latency
-    │    Deduplication)           │
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │         Kafka Cluster        │  ← 50 partitions
-    │   (Message Broker)           │    Replication factor: 3
-    │                              │    Retention: 24h
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │Worker Pool│  ← Auto-scaling
-    │   (Task Processors)          │    Consumer groups
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │      Result Store            │
-    │   PostgreSQL + Redis         │
-    └─────────────────────────────┘
-```
+1. Клиенты отправляют задачи в API2. Система принимает задачу и **надежно сохраняет**
+3. Задача попадает в очередь/лог4. Воркеры обрабатывают задачу5. Результат сохраняется/отправляется дальше6. Если обработка не удалась — происходит **retry**
+7. Из-за **at-least-once** возможны дубликаты, значит нужна **идемпотентность**
+
+Если latency <100ms относится к **приему задачи**, это реалистично.Если latency <100ms относится к **полной обработке end-to-end**, то это сильно зависит от бизнес-логики задачи. Для тяжелых задач лучше разделять:
+
+- **ingest latency** — принять и закоммитить задачу: <100ms- **processing latency** — зависит от типа задачи---
+
+#2. Ключевые архитектурные принципыДля таких требований я бы строил систему вокруг следующих принципов:
+
+##2.1. Разделение на два SLA**Не смешивать прием задачи и её выполнение**
+
+- **Слой ingestion** отвечает за быстрое принятие и подтверждение- **Слой processing** — за асинхронную обработкуЭто позволит удержать **<100ms на приём**, даже если обработка может быть длиннее.
+
+##2.2. Durable log / message broker как центральный буферДля50k RPS и горизонтального масштабирования нужен брокер с партиционированием:
+
+Подходящие варианты:
+- **Kafka**
+- **Pulsar**
+- реже: RabbitMQ, если нагрузка/масштаб прощеДля данного кейса я бы выбрал **Kafka**:
+- высокая пропускная способность- партиции = горизонтальное масштабирование- хорошая модель consumer groups- удобна для retry/DLQ/event-driven обработки##2.3. At-least-once = дубликаты допустимыЭто значит:
+- producer может отправить сообщение повторно- consumer может обработать сообщение повторно- задача может быть доставлена более одного разаСледовательно, система должна быть:
+- **idempotent on consume**
+- желательно **dedup-aware on ingest**
+
+##2.4. Stateless compute + state outsideВсе API и воркеры — stateless:
+- легко масштабируются горизонтально- состояние хранится в Kafka / DB / Redis / object store---
+
+#3. Предлагаемая архитектура---
+
+##3.1. Компоненты###1) API Gateway / Load BalancerФункции:
+- TLS termination- rate limiting- auth- routing на ingestion-serviceПримеры:
+- NGINX / Envoy / HAProxy- cloud LB---
+
+###2) Ingestion ServiceПринимает запросы от клиентов.
+
+Функции:
+- валидация- присвоение `task_id`
+- запись метаданных задачи- публикация в Kafka- быстрый ответ клиентуВажно: ingestion-service должен отвечать только после того, как задача **надежно принята**.
+
+Варианты надежного приема:
+1. **Сразу писать в Kafka** и отвечать после `acks=all`
+2. Либо сначала писать в DB, потом через outbox публиковать в KafkaДля требования **latency <100ms** я бы выбрал:
+- **синхронная запись в Kafka с replication**
+- ответ клиенту после подтверждения брокераЕсли нужна ещё и сильная бизнес-аудитность, можно добавить DB + outbox, но это увеличит latency и сложность.
 
 ---
 
-## 3. Детальный дизайн компонентов
+###3) Kafka ClusterЦентральный слой очередей.
 
-### 3.1 Intake Service
+Топики:
+- `tasks.main`
+- `tasks.retry.1m`
+- `tasks.retry.5m`
+- `tasks.retry.30m`
+- `tasks.dlq`
 
-```go
-// Критичный путь — должен быть максимально быстрым
-type TaskIngester struct {
-    kafka*kafka.Producer
-    redis     *redis.Client// dedup cache
-    validator *Validator
+Почему не одна очередь:
+- retry лучше выносить в отдельные потоки- DLQ нужен для неразрешимых ошибок- партиции позволяют масштабировать consumer-ов---
+
+###4) Task Metadata StoreХранилище статуса задач:
+
+Храним:
+- `task_id`
+- `idempotency_key`
+- статус (`accepted`, `processing`, `done`, `failed`, `retrying`)
+- timestamps- attempt count- payload hash- result / error codeВарианты:
+- **Cassandra / ScyllaDB** — если write-heavy и нужна масштабируемость- **PostgreSQL** — если объем умеренный и нужны транзакции- **DynamoDB / Bigtable / CosmosDB** — если managed cloudДля50k RPS и большой распределенной системы я бы рекомендовал:
+- **ScyllaDB/Cassandra** для task stateили- **DynamoDB** если облако позволяет---
+
+###5) Idempotency / Dedup StoreНужен для защиты от повторной отправки клиентом и повторной обработки.
+
+Варианты:
+- Redis — быстрый short-term dedup- основная DB — long-term dedup / authoritative stateТипичный подход:
+- `idempotency_key -> task_id`
+- TTL зависит от бизнес-требований---
+
+###6) Worker ServiceГоризонтально масштабируемые воркеры.
+
+Функции:
+- читать из Kafka consumer group- выполнять бизнес-логику- обновлять статус задачи- коммитить offset только после успешной обработки/сохранения результата- при ошибке отправлять в retry или DLQ---
+
+###7) Result Store / Downstream IntegrationsЗависит от задачи:
+- DB- cache- object store- вызовы внешних сервисов- публикация в другой топик---
+
+###8) Observability StackОбязательно:
+- Prometheus / Grafana- OpenTelemetry- centralized logs- tracing- алерты по lag, retry-rate, DLQ-rate, p99 latency---
+
+#4. Поток обработки##4.1. Приём задачи1. Клиент вызывает `POST /tasks`
+2. API Gateway проксирует в ingestion-service3. Ingestion-service:
+- валидирует payload - извлекает/создает `idempotency_key`
+- генерирует `task_id`
+- пишет событие в Kafka (`tasks.main`)
+- при необходимости сохраняет metadata со статусом `accepted`
+4. После подтверждения Kafka (`acks=all`) возвращает:
+- `202 Accepted`
+- `task_id`
+
+### Почему `202 Accepted`?
+Потому что задача принята в обработку, а не обязательно выполнена.
+
+---
+
+##4.2. Обработка воркером1. Worker читает сообщение из `tasks.main`
+2. Пытается “захватить” обработку задачи3. Выполняет бизнес-логику4. Если успешно:
+- пишет результат - обновляет статус `done`
+- коммитит offset5. Если временная ошибка:
+- увеличивает attempt count - публикует в retry topic - коммитит offset исходного сообщения6. Если постоянная ошибка:
+- пишет в DLQ - статус `failed`
+- коммитит offset---
+
+#5. Как обеспечить at-least-onceAt-least-once в этой архитектуре обеспечивается так:
+
+## На входе- Ingestion публикует в Kafka с `acks=all`
+- replication factor >=3- producer retries enabled- idempotent producer желательно включить## На обработке- consumer **не коммитит offset**, пока обработка не завершена- если воркер упал после обработки, но до commit offset — сообщение будет прочитано повторно- значит дубликаты неизбежны## Вывод**Гарантия at-least-once достигается ценой потенциальных дублей.**
+
+---
+
+#6. Как бороться с дублямиЭто критично.
+
+##6.1. Idempotency keyКлиент передает:
+- `Idempotency-Key: <uuid>`
+
+Или система генерирует ключ на основе payload.
+
+Сценарий:
+- если клиент повторно отправляет тот же запрос- ingestion проверяет `idempotency_key`
+- если уже есть `task_id`, возвращает его же---
+
+##6.2. Idempotent consumerWorker перед выполнением проверяет:
+- обработана ли уже задача/attempt?
+- есть ли финальный статус?
+
+Если `done`, то просто коммитит offset и не делает повторную обработку.
+
+---
+
+##6.3. Idempotent side effectsСамое сложное — внешние вызовы.
+
+Примеры:
+- отправка email- списание денег- вызов партнерского APIНужно:
+- использовать external idempotency keys- или таблицу “executed_operations”
+- или transactional outbox/inbox pattern---
+
+#7. Выбор технологии хранения статусаЗависит от паттерна чтения/записи.
+
+## Если очень много writes, мало сложных запросовЛучше:
+- Cassandra / ScyllaПлюсы:
+- горизонтальное масштабирование- высокая write throughput- низкая latencyМинусы:
+- сложнее модель данных- ограниченные ad-hoc queries## Если нужен сильный ACID и умеренная нагрузкаМожно:
+- PostgreSQL + shardingНо для50k RPS как single primary — уже рискованно.
+
+## Если облако- DynamoDB часто отличный выбор:
+- managed - autoscaling - conditional writes для dedup/idempotency---
+
+#8. ПартиционированиеДля50k RPS это обязательный элемент.
+
+## Kafka partitionsНапример:
+- `tasks.main` =128–512 partitions на старте- количество зависит от throughput, message size, числа consumers, retentionКлюч партиционирования:
+- `task_id`
+  или- `customer_id`, если важен порядок внутри клиента### Если нужен порядокЕсли важно, чтобы задачи одного клиента шли последовательно:
+- partition key = `customer_id`
+
+Но это ухудшает равномерность распределения при hot keys.
+
+---
+
+## Хранилище статусаPartition key:
+- `task_id`
+  или- `(tenant_id, task_id)`
+
+Если multi-tenant — лучше включать tenant в ключ.
+
+---
+
+#9. Retry strategyНельзя делать retry “в лоб” мгновенно, иначе получите retry storm.
+
+## Нужны:
+- exponential backoff- jitter- ограничение max attempts- DLQПример:
+  -1-я ошибка → retry через1 мин-2-я → через5 мин-3-я → через30 мин- затем DLQ## Важное разделение ошибок- **Transient**: timeout,503, network issue → retry- **Permanent**: validation error, malformed payload, business rejection → DLQ / fail---
+
+#10. Как уложиться в latency <100msЕсли речь про прием задачи:
+
+## Критический путь:
+1. LB2. Ingestion service3. Kafka produce `acks=all`
+4. Ответ клиентуЧтобы это было <100ms p95/p99, нужно:
+
+- держать ingestion stateless и легким- не делать тяжелых синхронных операций- не писать синхронно в несколько систем на критическом пути- использовать локальный регион / AZ-aware deployment- держать payload небольшим- использовать connection pooling- batch/linger в Kafka очень аккуратно, чтобы не ухудшить latency- replication factor3, быстрые SSD, хорошая сеть### Что не стоит делать на sync path:
+- тяжелые JOIN в БД- внешние HTTP calls- сложную бизнес-логику- антивирус/архив/большие трансформации---
+
+#11. Масштабирование## Горизонтально масштабируются:
+- API Gateway- Ingestion Service- Worker Service- Kafka brokers- DB nodes- Redis nodes## Как масштабировать:
+- ingestion — по CPU / request rate / p95 latency- workers — по consumer lag / processing latency- Kafka — через увеличение partitions и brokers- DB — через добавление нод, шардирование## Автоскейлинг сигналы:
+- RPS- p95 latency- queue lag- CPU/memory- error rate---
+
+#12. Отказоустойчивость## Нужно заложить:
+- deployment минимум в3 AZ- Kafka replication factor =3- `min.insync.replicas =2`
+- DB replication- rolling deployments- graceful shutdown у воркеров- readiness/liveness probes- backpressure## Graceful shutdown для worker:
+- перестать брать новые сообщения- завершить текущие- коммитнуть offsets- затем выключиться---
+
+#13. Backpressure и защита системыНа50k RPS это обязательно.
+
+## На входе:
+- rate limiting на tenant/client- quotas- admission control## На обработке:
+- ограничение concurrency в worker- circuit breaker на downstream- bulkhead isolation- bounded retry- queue lag based throttlingЕсли downstream начинает тормозить:
+- лучше замедлить intake для части клиентов- чем положить всю систему---
+
+#14. API контракт## POST /tasksHeaders:
+- `Idempotency-Key`
+
+Body:
+```json{
+ "type": "generate_report",
+ "tenant_id": "t1",
+ "payload": {
+ "report_id":123 }
 }
+```
 
-func (t *TaskIngester) Submit(ctx context.Context, task Task) error {
-    // 1. Валидация — sync,< 1ms
-    if err := t.validator.Validate(task); err != nil {
-        return ErrInvalidTask
-    }
-
-    // 2. Deduplication через Redis (TTL = 24h)
-    // Bloom filter для снижения нагрузки на Redis
-    isDup, err := t.checkDuplicate(ctx, task.ID)
-    if isDup {
-        return nil // idempotent
-    }
-
-    // 3. Async publish в Kafka
-    // НЕ ждём подтверждения от Kafka — отвечаем клиенту сразу
-    // Durability обеспечивается WAL на стороне Kafka
-    return t.kafka.ProduceAsync(task, t.onDelivery)
+Response:
+```json{
+ "task_id": "01HXYZ...",
+ "status": "accepted"
 }
 ```
 
-### 3.2 Kafka Configuration
-
-```yaml
-# broker config
-num.partitions: 50
-replication.factor: 3
-min.insync.replicas: 2
-
-# producer config (Intake Service)
-acks: all              # Гарантия записи на2+ реплики
-enable.idempotence: true
-compression.type: lz4  # CPU vs network tradeoff
-linger.ms: 5# Batching для throughput
-batch.size: 65536
-
-# consumer config (Workers)
-max.poll.records: 500
-enable.auto.commit: false# Manual commit после обработки!
-fetch.min.bytes: 1024
-```
-
-### 3.3 Worker Service
-
-```go
-type Worker struct {
-    consumer *kafka.Consumer
-    store    *ResultStore
-    metrics  *prometheus.Registry
-}
-
-func (w *Worker) ProcessLoop(ctx context.Context) {
-    for {
-        messages := w.consumer.Poll(ctx, 100*time.Millisecond)
-        // Параллельная обработка batch
-        var wg sync.WaitGroup
-        results := make(chan Result, len(messages))
-        
-        for _, msg := range messages {
-            wg.Add(1)
-            go func(m Message) {
-                defer wg.Done()
-                
-                result, err := w.processWithTimeout(m,80*time.Millisecond)
-                if err != nil {
-                    // Отправляем в Dead Letter Queue
-                    w.sendToDLQ(m, err)
-                    return
-                }
-                results <- result
-            }(msg)
-        }
-        
-        wg.Wait()
-        close(results)
-        
-        // Сохраняем результаты batch
-        w.store.BatchSave(ctx, results)
-        
-        // Commit ТОЛЬКО после успешного сохранения
-        // Это обеспечивает at-least-once
-        w.consumer.CommitOffsets()
-    }
+## GET /tasks/{task_id}
+Response:
+```json{
+ "task_id": "01HXYZ...",
+ "status": "processing",
+ "attempt":2,
+ "created_at": "2026-04-18T13:00:00Z"
 }
 ```
 
-### 3.4 Гарантия At-Least-Once
+---
 
-```
-Сценарий сбоя:
+#15. Модель данных статуса задачиПример:
 
-┌──────────┐┌───────┐     ┌────────┐     ┌────────┐
-│  Worker  │────▶│Process│────▶│  Save  │────▶│ Commit │
-└──────────┘     └───────┘     └────────┘     └────────┘↑Crash здесь →
-                              Kafka переотправит сообщение
-                              Worker должен быть idempotent!
-
-Решение: task_id как idempotency key в БД
-INSERT INTO results (task_id, ...) 
-ON CONFLICT (task_id) DO NOTHING;
+```json{
+ "task_id": "uuid",
+ "tenant_id": "t1",
+ "idempotency_key": "uuid",
+ "status": "accepted|processing|done|failed|retrying",
+ "attempt_count":2,
+ "payload_hash": "sha256...",
+ "result_ref": "s3://bucket/result/...",
+ "error_code": "TIMEOUT",
+ "created_at": "...",
+ "updated_at": "...",
+ "next_retry_at": "..."
+}
 ```
 
 ---
 
-## 4. Latency Breakdown
+#16. Важный architectural decision: Kafka-first vs DB-first## Вариант A: Kafka-firstКлиентский запрос -> Kafka -> ответ### Плюсы:
+- минимальный latency- высокая throughput- проще ingest path### Минусы:
+- статус задачи нужно потом материализовать отдельно- сложнее query-by-task если не сохраняете metadata сразу## Вариант B: DB + OutboxКлиентский запрос -> DB transaction -> outbox -> Kafka### Плюсы:
+- сильнее консистентность бизнес-состояния- удобно хранить статус и дедуп прямо в DB### Минусы:
+- выше latency- выше нагрузка на DB- сложнее держать50k RPS### Мой выборДля ваших требований:
+- **Kafka-first для ingest**
+- **асинхронная материализация статуса**
+- при необходимости — быстрый metadata write в scalable KV store---
 
-```
-Бюджет 100ms распределяем:
+#17. Рекомендуемый стекОдин из практичных стеков:
 
-[Client → API GW]~5ms   (network)
-[API GW → Intake]        ~2ms   (internal)
-[Validation + Dedup]     ~3ms   (Redis lookup)
-[Kafka Produce]          ~10ms  (async, не блокирует ответ!)
-[Ответ клиенту]         ~20ms  TOTAL✓
+- **LB/API Gateway**: Envoy / NGINX- **Ingestion Service**: Go / Java / Kotlin- **Broker**: Kafka- **Schema**: Avro / Protobuf + Schema Registry- **Workers**: Go / Java- **Task State Store**: ScyllaDB / Cassandra / DynamoDB- **Cache / short dedup**: Redis- **Observability**: Prometheus, Grafana, Loki/ELK, Jaeger/Tempo, OpenTelemetry- **Orchestration**: KubernetesПочему Go/Java:
+- хорошие Kafka клиенты- predictable performance- удобно держать high concurrency---
 
-──────────────────────────────────────────
-[Kafka → Worker]         ~15ms  (polling interval)
-[Task Processing]        ~50ms  (бизнес-логика)
-[Save Result]            ~10ms  (DB write)
-[Kafka Commit]           ~5ms         ~80ms  async processing
-```
-
----
-
-## 5. Масштабирование
-
-```
-Horizontal Scaling Strategy:
-
-RPS Growth:
-10K→ 4Intake pods+ 10 Worker pods
-50K  → 20 Intake pods + 50 Worker pods  
-100K → 40 Intake pods + 100 Worker pods
-
-Kafka Partitions = max(Worker pods) → 50 partitions
-1 partition = 1 worker consumer (ordering guarantee)
-
-Auto-scaling triggers:
-- CPU > 70%→ +2 pods
-- Lag > 10K messages → +5 worker pods
-- Latency P99 > 80ms → +2 intake pods
-```
+#18. Минимальная схема развертывания## По регионамЕсли один регион:
+-3 AZ- Kafka cluster3–5 brokers- DB cluster3+ nodes- ingestion replicas10–50+
+- worker replicas по нагрузке## Если multi-regionНужно решить:
+- active-passiveили- active-activeДля начала я бы рекомендовал:
+- **single region, multi-AZ**
+- multi-region DR как следующий этапПотому что active-active сильно усложняет idempotency, ordering и dedup.
 
 ---
 
-## 6. Data Layer
+#19. Основные риски##1. Exactly-once хотят “на словах”, а пишут at-least-onceНужно явно зафиксировать:
+- дубликаты возможны- downstream должен быть идемпотентен##2. Синхронные тяжелые операции на ingest pathЭто убьет <100ms.
 
-```
-┌─────────────────────────────────────────────┐
-│              Redis Cluster                   │
-│- Dedup cache (Bloom Filter + exact check) │
-│  - Task status cache (TTL 1h)               │
-│  - Rate limiting counters                   │
-│  6 nodes, 3 shards × 2 replicas            │
-└─────────────────────────────────────────────┘
+##3. Hot partitionsЕсли partition key выбран плохо, часть брокеров/воркеров будет перегружена.
 
-┌─────────────────────────────────────────────┐
-│           PostgreSQL (Citus)                │
-│  - Task results (sharded by task_id)        │
-│  - Audit log                │
-│  - DLQ metadata                             │
-│  Sharding key: task_id % 16                 │
-└─────────────────────────────────────────────┘
-```
+##4. Retry stormБез backoff + jitter система сама себя положит.
+
+##5. Отсутствие backpressureПри деградации downstream нагрузка накопится и выбьет все слои.
 
 ---
 
-## 7. Observability
+#20. Предлагаемый финальный дизайн## High-level architecture```textClient -> API Gateway / LB -> Ingestion Service -> Kafka (tasks.main)
+-> Task Metadata Store (optional sync/lightweight or async materialization)
 
-```yaml
-Metrics (Prometheus + Grafana):
-  - tasks_submitted_total (counter)
-  - tasks_processed_total (counter, labels: status)
-  - kafka_consumer_lag (gauge, alert > 50K)
-  - processing_duration_p99 (histogram)
-  - dlq_messages_total (counter, alert > 0)
-
-Tracing (Jaeger):
-  - trace_id propagation через все сервисы
-  - Sample rate: 1% normal, 100% errors
-
-Alerts:
-  - Consumer lag > 50K → PagerDuty
-  - DLQ rate > 0.1% → Slack
-  - P99 latency > 90ms → PagerDuty
-```
+Kafka -> Worker Group -> Business Processing -> Result Store / Downstream APIs -> Task Metadata Store -> Retry Topics / DLQ```
 
 ---
 
-## 8. Failure Modes & Mitigations
+#21. Ключевые решения## Я бы предложил так:
 
-| Сценарий | Поведение | Решение |
-|---|---|---|
-| Kafka broker down | Producer retry | min.insync.replicas=2 |
-| Worker crash | Uncommitted offset → retry | Idempotent processing |
-| Redis down | Dedup отключается | Graceful degradation |
-| DB overload | Backpressure | Circuit breaker + queue |
-| Poison pill message | Бесконечный retry | DLQ после3 попыток |
+### Ingest- stateless ingestion-service- publish в Kafka с `acks=all`
+- response `202 Accepted` после durable append- idempotency key обязателен### Queue/Broker- Kafka- replication factor3- много partitions- producer idempotence enabled### Processing- consumer groups- manual offset commit only after processing- retry topics + DLQ- exponential backoff### State- отдельное хранилище статусов задач- Scylla/Cassandra/DynamoDB- idempotent writes / conditional updates### Reliability- multi-AZ- backpressure- rate limits- observability- autoscaling by lag and latency---
+
+#22. Если нужно сформулировать коротко “архитектурный ответ на интервью”
+
+Можно ответить так:
+
+> Я бы построил систему как асинхронный pipeline: stateless ingestion layer принимает задачи через LB, валидирует и публикует их в Kafka с `acks=all`, что дает durable acceptance и позволяет удерживать latency приема <100ms. Далее горизонтально масштабируемые worker'ы читают сообщения через consumer groups, обрабатывают их и коммитят offset только после успешного завершения, что обеспечивает at-least-once delivery. Для борьбы с дублями вводится idempotency key на уровне API и idempotent processing на уровне worker'ов. Статусы задач и attempt counters хранятся в масштабируемом KV/wide-column store вроде ScyllaDB/Cassandra или DynamoDB. Для ошибок используются retry topics с exponential backoff и DLQ. Вся система разворачивается stateless + partitioned, с autoscaling по RPS и consumer lag, и с полной observability по latency, lag, retries и DLQ.
 
 ---
 
-## 9. Итоговая оценка
-
-```
-ТребованиеРешение                Статус
-─────────────────────────────────────────────────────
-50K RPS             20 stateless pods           ✅    + Kafka buffering
-
-At-least-once       Manual Kafka commit         ✅
-                    + Idempotent writes
-
-Latency < 100ms     Async Kafka produce         ✅
-                    Response до commit
-
-Horizontal scale    Stateless services          ✅
-                    + Kafka partitions
-```
-
-> **Главный архитектурный принцип:** Intake отвечает клиенту **до** Kafka commit, но **после** того как данные приняты в память брокера. Workers коммитят оффсет **только после** успешного сохранения результата. Это даёт нам и низкую latency, и at-least-once гарантию.
+Если хочешь, я могу следующим сообщением дать еще **3 артефакта**:
+1. **C4/текстовую схему компонентов**,2. **список нефункциональных требований и trade-offs**,3. **пример ответа в формате system design interview на5–7 минут**.

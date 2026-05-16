@@ -1,278 +1,272 @@
-# Distributed Task Processing System
+# Solution Architecture: Распределённая система обработки задач
 
-## 1. Анализ требований
-
-```
-50,000 RPS → ~4.3 млрд задач/день
-At-least-once → нужен acknowledgment + retry механизм  
-Latency < 100ms → P99, end-to-end
-Horizontal scaling → stateless workers + partitioned storage
-```
-
----
-
-## 2. High-Level Architecture
+## 1. Обзор архитектуры
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        CLIENTS│
-└──────────────────┬──────────────────────────────────────────┘│┌─────────▼─────────┐
-         │   API Gateway      │  ← Rate limiting, auth
-         │   (Nginx/Envoy)    │    10instances
-         └─────────┬─────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │      Intake Service│  ← Stateless, 20 instances
-    │   (Task Validation +│    Go/Rust для низкой latency
-    │    Deduplication)           │
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │         Kafka Cluster        │  ← 50 partitions
-    │   (Message Broker)           │    Replication factor: 3
-    │                              │    Retention: 24h
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │Worker Pool│  ← Auto-scaling
-    │   (Task Processors)          │    Consumer groups
-    └──────────────┬──────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │      Result Store            │
-    │   PostgreSQL + Redis         │
-    └─────────────────────────────┘
+┌─────────────┐
+│   Clients   │ (50k RPS)
+└──────┬──────┘│
+┌──────▼──────────────────┐
+│  API Gateway (LB)       │← Rate limiting, routing
+├─────────────────────────┤
+│  - Nginx/HAProxy        │
+│  - Circuit breaker      │
+└──────┬──────────────────┘
+       │
+┌──────▼──────────────────────────┐
+│  Message Queue (Event Bus)      │ ← At-least-once guarantee
+├─────────────────────────────────┤
+│  - Apache Kafka/RabbitMQ│
+│  - Partitioned by task type     │
+│  - Replication factor: 3        │
+└──────┬──────────────────────────┘
+       │
+┌──────▼──────────────────────────────────────┐
+│  Task Processing Workers (Horizontal)      │
+├─────────────────────────────────────────────┤
+│  - Worker Pool1, 2, 3... N │
+│  - Consumer groups в Kafka                │
+│  - Graceful shutdown, idempotency           │
+└──────┬──────────────────────────────────────┘
+       │
+┌──────▼──────────────────────┐
+│  Result Store│
+├─────────────────────────────┤
+│  - Redis (cache)│
+│  - PostgreSQL (persistence) │
+│  - TTL для результатов      │
+└─────────────────────────────┘
 ```
 
----
+## 2. Компоненты решения
 
-## 3. Детальный дизайн компонентов
-
-### 3.1 Intake Service
-
-```go
-// Критичный путь — должен быть максимально быстрым
-type TaskIngester struct {
-    kafka*kafka.Producer
-    redis     *redis.Client// dedup cache
-    validator *Validator
-}
-
-func (t *TaskIngester) Submit(ctx context.Context, task Task) error {
-    // 1. Валидация — sync,< 1ms
-    if err := t.validator.Validate(task); err != nil {
-        return ErrInvalidTask
-    }
-
-    // 2. Deduplication через Redis (TTL = 24h)
-    // Bloom filter для снижения нагрузки на Redis
-    isDup, err := t.checkDuplicate(ctx, task.ID)
-    if isDup {
-        return nil // idempotent
-    }
-
-    // 3. Async publish в Kafka
-    // НЕ ждём подтверждения от Kafka — отвечаем клиенту сразу
-    // Durability обеспечивается WAL на стороне Kafka
-    return t.kafka.ProduceAsync(task, t.onDelivery)
-}
-```
-
-### 3.2 Kafka Configuration
-
+### **API Gateway**
 ```yaml
-# broker config
-num.partitions: 50
-replication.factor: 3
-min.insync.replicas: 2
-
-# producer config (Intake Service)
-acks: all              # Гарантия записи на2+ реплики
-enable.idempotence: true
-compression.type: lz4  # CPU vs network tradeoff
-linger.ms: 5# Batching для throughput
-batch.size: 65536
-
-# consumer config (Workers)
-max.poll.records: 500
-enable.auto.commit: false# Manual commit после обработки!
-fetch.min.bytes: 1024
+Load Balancer:
+  - Nginx/HAProxy (active-active)
+  - Health checks каждые 5 сек
+  - Timeout: 95ms (buffer для обработки)
+  
+Rate Limiting:
+  - Token bucket: 50k RPS / количество инстансов
+  - Per-client quotas
 ```
 
-### 3.3 Worker Service
+### **Message Queue (Kafka)**
+```yaml
+Конфигурация:
+  partitions: 10-20 (scalability)
+  replication_factor: 3 (reliability)
+  min_insync_replicas: 2 (durability)
+  
+Topic settings:
+  acks: all (гарантия доставки)
+  compression: snappy
+  retention: 24 hours
+```
 
-```go
-type Worker struct {
-    consumer *kafka.Consumer
-    store    *ResultStore
-    metrics  *prometheus.Registry
-}
+### **Worker Nodes**
+```python
+# Пример worker'а
+from kafka import KafkaConsumer
+import json
+import logging
 
-func (w *Worker) ProcessLoop(ctx context.Context) {
-    for {
-        messages := w.consumer.Poll(ctx, 100*time.Millisecond)
-        // Параллельная обработка batch
-        var wg sync.WaitGroup
-        results := make(chan Result, len(messages))
+class TaskWorker:
+    def __init__(self):
+        self.consumer = KafkaConsumer(
+            'tasks',
+            group_id='workers',
+            bootstrap_servers=['kafka:9092'],
+            max_poll_records=100,
+            session_timeout_ms=30000,
+            heartbeat_interval_ms=10000
+        )
+        self.redis = Redis(host='redis', port=6379)
         
-        for _, msg := range messages {
-            wg.Add(1)
-            go func(m Message) {
-                defer wg.Done()
+    def process(self):
+        for message in self.consumer:
+            try:
+                task = json.loads(message.value)
+                task_id = task['id']
                 
-                result, err := w.processWithTimeout(m,80*time.Millisecond)
-                if err != nil {
-                    // Отправляем в Dead Letter Queue
-                    w.sendToDLQ(m, err)
-                    return
-                }
-                results <- result
-            }(msg)
-        }
+                # Идемпотентность: проверяем дубликат
+                if self.redis.exists(f"processed:{task_id}"):
+                    logging.info(f"Task {task_id} already processed")
+                    continue
+                
+                # Обработка задачи (< 100ms)
+                result = self.execute_task(task)
+                
+                # Сохранение результата
+                self.redis.setex(
+                    f"result:{task_id}",
+                    3600,  # TTL1 час
+                    json.dumps(result)
+                )# Отметить как обработано
+                self.redis.setex(
+                    f"processed:{task_id}",
+                    86400,  # 24 часа для дедупликации
+                    "1"
+                )
+                # Commit offset после успеха
+                self.consumer.commit()
+                
+            except Exception as e:
+                logging.error(f"Error processing task: {e}")
+                # Retry логика или DLQ
+                self.send_to_dlq(message)
+    
+    def execute_task(self, task):
+        # Ваша бизнес-логика
+        start = time.time()
+        result = process_business_logic(task)
+        elapsed = time.time() - start
         
-        wg.Wait()
-        close(results)
+        if elapsed > 100:
+            logging.warning(f"Slow task: {elapsed*1000}ms")
         
-        // Сохраняем результаты batch
-        w.store.BatchSave(ctx, results)
-        
-        // Commit ТОЛЬКО после успешного сохранения
-        // Это обеспечивает at-least-once
-        w.consumer.CommitOffsets()
-    }
-}
+        return result
 ```
 
-### 3.4 Гарантия At-Least-Once
-
-```
-Сценарий сбоя:
-
-┌──────────┐┌───────┐     ┌────────┐     ┌────────┐
-│  Worker  │────▶│Process│────▶│  Save  │────▶│ Commit │
-└──────────┘     └───────┘     └────────┘     └────────┘↑Crash здесь →
-                              Kafka переотправит сообщение
-                              Worker должен быть idempotent!
-
-Решение: task_id как idempotency key в БД
-INSERT INTO results (task_id, ...) 
-ON CONFLICT (task_id) DO NOTHING;
-```
-
----
-
-## 4. Latency Breakdown
-
-```
-Бюджет 100ms распределяем:
-
-[Client → API GW]~5ms   (network)
-[API GW → Intake]        ~2ms   (internal)
-[Validation + Dedup]     ~3ms   (Redis lookup)
-[Kafka Produce]          ~10ms  (async, не блокирует ответ!)
-[Ответ клиенту]         ~20ms  TOTAL✓
-
-──────────────────────────────────────────
-[Kafka → Worker]         ~15ms  (polling interval)
-[Task Processing]        ~50ms  (бизнес-логика)
-[Save Result]            ~10ms  (DB write)
-[Kafka Commit]           ~5ms         ~80ms  async processing
-```
-
----
-
-## 5. Масштабирование
-
-```
-Horizontal Scaling Strategy:
-
-RPS Growth:
-10K→ 4Intake pods+ 10 Worker pods
-50K  → 20 Intake pods + 50 Worker pods  
-100K → 40 Intake pods + 100 Worker pods
-
-Kafka Partitions = max(Worker pods) → 50 partitions
-1 partition = 1 worker consumer (ordering guarantee)
-
-Auto-scaling triggers:
-- CPU > 70%→ +2 pods
-- Lag > 10K messages → +5 worker pods
-- Latency P99 > 80ms → +2 intake pods
-```
-
----
-
-## 6. Data Layer
-
-```
-┌─────────────────────────────────────────────┐
-│              Redis Cluster                   │
-│- Dedup cache (Bloom Filter + exact check) │
-│  - Task status cache (TTL 1h)               │
-│  - Rate limiting counters                   │
-│  6 nodes, 3 shards × 2 replicas            │
-└─────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────┐
-│           PostgreSQL (Citus)                │
-│  - Task results (sharded by task_id)        │
-│  - Audit log                │
-│  - DLQ metadata                             │
-│  Sharding key: task_id % 16                 │
-└─────────────────────────────────────────────┘
-```
-
----
-
-## 7. Observability
+## 3. Гарантии доставки (At-least-once)
 
 ```yaml
-Metrics (Prometheus + Grafana):
-  - tasks_submitted_total (counter)
-  - tasks_processed_total (counter, labels: status)
-  - kafka_consumer_lag (gauge, alert > 50K)
-  - processing_duration_p99 (histogram)
-  - dlq_messages_total (counter, alert > 0)
-
-Tracing (Jaeger):
-  - trace_id propagation через все сервисы
-  - Sample rate: 1% normal, 100% errors
-
-Alerts:
-  - Consumer lag > 50K → PagerDuty
-  - DLQ rate > 0.1% → Slack
-  - P99 latency > 90ms → PagerDuty
+Producer side:
+  acks: all                    # Ждём подтверждения от всех replicas
+  retries: 3
+  max_in_flight_requests: 5
+  
+Consumer side:
+  enable_auto_commit: false   # Ручной commit
+  isolation_level: read_committed
+  
+Идемпотентность:
+  - Уникальный task_id
+  - Redis для отслеживания обработанных
+  - Версионирование результатов
 ```
+
+## 4. Оптимизация latency < 100ms
+
+```yaml
+Сетевой уровень:
+  - CDN для API Gateway
+  - Connection pooling
+  - Keep-alive connections
+  - Compression (gzip)
+
+Обработка:
+  - Async I/O (asyncio/tokio)
+  - Batch processing (макс 100 задач)
+  - Кеширование (Redis)
+  - Database indexing
+
+Мониторинг:
+  - P50:< 20ms
+  - P95: < 80ms
+  - P99: < 100ms
+```
+
+## 5. Горизонтальное масштабирование
+
+```yaml
+Auto-scaling:
+  Metrics:
+    - Queue lag (Kafka consumer lag)
+    - CPU usage > 70%
+    - Memory > 80%
+  
+  Actions:
+    - Добавить worker nodes
+    - Увеличить partitions в Kafka
+    - Scale API Gateway
+
+Kubernetes deployment:
+  ---
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: task-worker
+  spec:
+    replicas: 10# стартовое количество
+    selector:
+      matchLabels:
+        app: task-worker
+    template:
+      spec:
+        containers:
+        - name: worker
+          image: task-worker:latest
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        
+        # Graceful shutdown
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 15"]
+  
+  ---
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: task-worker-hpa
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: task-worker
+    minReplicas: 10
+    maxReplicas: 100
+    metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: kafka_consumer_lag
+        target:
+          type: AverageValue
+          averageValue: "1000"
+```
+
+## 6. Мониторинг и наблюдаемость
+
+```yaml
+Метрики:
+  - Prometheus + Grafana
+  - Kafka metrics (lag, throughput)
+  - Worker metrics (processing time, errors)
+  
+Логирование:
+  - ELK Stack (Elasticsearch, Logstash, Kibana)
+  - Structured logging (JSON)
+  
+Трейсинг:
+  - Jaeger для распределённого трейсинга
+  - Trace ID через всю систему
+```
+
+## 7. Ключевые риски и решения
+
+| Риск | Решение |
+|------|---------|
+| Потеря сообщений | Replication factor 3, acks=all |
+| Дублирование обработки | Идемпотентные операции + Redis |
+| Задержка > 100ms | Async processing, кеширование |
+| Worker crashes | Graceful shutdown, rebalancing |
+| Kafka bottleneck | Partitioning, увеличение replicas |
 
 ---
 
-## 8. Failure Modes & Mitigations
-
-| Сценарий | Поведение | Решение |
-|---|---|---|
-| Kafka broker down | Producer retry | min.insync.replicas=2 |
-| Worker crash | Uncommitted offset → retry | Idempotent processing |
-| Redis down | Dedup отключается | Graceful degradation |
-| DB overload | Backpressure | Circuit breaker + queue |
-| Poison pill message | Бесконечный retry | DLQ после3 попыток |
-
----
-
-## 9. Итоговая оценка
-
-```
-ТребованиеРешение                Статус
-─────────────────────────────────────────────────────
-50K RPS             20 stateless pods           ✅    + Kafka buffering
-
-At-least-once       Manual Kafka commit         ✅
-                    + Idempotent writes
-
-Latency < 100ms     Async Kafka produce         ✅
-                    Response до commit
-
-Horizontal scale    Stateless services          ✅
-                    + Kafka partitions
-```
-
-> **Главный архитектурный принцип:** Intake отвечает клиенту **до** Kafka commit, но **после** того как данные приняты в память брокера. Workers коммитят оффсет **только после** успешного сохранения результата. Это даёт нам и низкую latency, и at-least-once гарантию.
+**Это production-ready архитектура**, готовая к 50k RPS с гарантиями. Нужны детали по конкретным компонентам?
