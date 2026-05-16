@@ -39,7 +39,7 @@ def detect_language(text: str) -> str:
 def slugify(text: str) -> str:
     """Convert heading text to a lowercase underscore slug."""
     text = text.lower()
-    text = re.sub(r'[^a-z0-9а-яёa-z\s]', ' ', text)
+    text = re.sub(r'[^a-z0-9а-яёё\s]', ' ', text)
     text = re.sub(r'\s+', '_', text.strip())
     return text
 
@@ -159,12 +159,54 @@ def maybe_split_large_chunk(chunk: dict, overlap_sentences: int = 2) -> list:
     """
     If chunk exceeds 700 tokens (~2800 chars), split at paragraph boundaries.
     Carry last `overlap_sentences` sentences of previous sub-chunk into next.
+    If a single paragraph exceeds 700 tokens, split at sentence boundaries.
     """
     text = chunk["text"]
     if token_count(text) <= 700:
         return [chunk]
 
     paragraphs = re.split(r'\n\n+', text)
+
+    # If only one paragraph, split at sentence boundaries instead
+    if len(paragraphs) == 1:
+        sentences = split_sentences(text)
+        if len(sentences) <= 1:
+            # Cannot split further — return as-is (original chunk_id, no suffix)
+            return [chunk]
+        # Build sentence-level sub-chunks
+        sub_chunks: list = []
+        buffer_sents: list = []
+        overlap_text = ""
+        idx = 0
+        for sent in sentences:
+            test = " ".join(buffer_sents + [sent])
+            if token_count(overlap_text + test) > 700 and buffer_sents:
+                sub_text = (overlap_text + " ".join(buffer_sents)).strip()
+                sub = dict(chunk)
+                sub["text"] = sub_text
+                sub["metadata"] = dict(chunk["metadata"])
+                sub["metadata"]["chunk_id"] = f"{chunk['metadata']['chunk_id']}_{idx}"
+                sub["metadata"]["token_count_approx"] = token_count(sub_text)
+                sub["metadata"]["summary"] = extract_summary(sub_text)
+                sub_chunks.append(sub)
+                tail = buffer_sents[-overlap_sentences:] if len(buffer_sents) >= overlap_sentences else buffer_sents
+                overlap_text = " ".join(tail) + " " if tail else ""
+                buffer_sents = [sent]
+                idx += 1
+            else:
+                buffer_sents.append(sent)
+        if buffer_sents:
+            sub_text = (overlap_text + " ".join(buffer_sents)).strip()
+            sub = dict(chunk)
+            sub["text"] = sub_text
+            sub["metadata"] = dict(chunk["metadata"])
+            sub["metadata"]["chunk_id"] = f"{chunk['metadata']['chunk_id']}_{idx}"
+            sub["metadata"]["token_count_approx"] = token_count(sub_text)
+            sub["metadata"]["summary"] = extract_summary(sub_text)
+            sub_chunks.append(sub)
+        return sub_chunks if sub_chunks else [chunk]
+
+    # Multi-paragraph: split at paragraph boundaries
     sub_chunks = []
     buffer = []
     overlap_text = ""
@@ -172,17 +214,15 @@ def maybe_split_large_chunk(chunk: dict, overlap_sentences: int = 2) -> list:
 
     for para in paragraphs:
         test_buf = buffer + [para]
-        if token_count("\n\n".join(test_buf)) > 700 and buffer:
-            # emit current buffer
-            sub_text = overlap_text + "\n\n".join(buffer)
+        if token_count(overlap_text + "\n\n".join(test_buf)) > 700 and buffer:
+            sub_text = (overlap_text + "\n\n".join(buffer)).strip()
             sub = dict(chunk)
-            sub["text"] = sub_text.strip()
+            sub["text"] = sub_text
             sub["metadata"] = dict(chunk["metadata"])
             sub["metadata"]["chunk_id"] = f"{chunk['metadata']['chunk_id']}_{idx}"
-            sub["metadata"]["token_count_approx"] = token_count(sub["text"])
-            sub["metadata"]["summary"] = extract_summary(sub["text"])
+            sub["metadata"]["token_count_approx"] = token_count(sub_text)
+            sub["metadata"]["summary"] = extract_summary(sub_text)
             sub_chunks.append(sub)
-            # compute overlap
             sentences = split_sentences("\n\n".join(buffer))
             tail = sentences[-overlap_sentences:] if len(sentences) >= overlap_sentences else sentences
             overlap_text = " ".join(tail) + "\n\n" if tail else ""
@@ -192,13 +232,13 @@ def maybe_split_large_chunk(chunk: dict, overlap_sentences: int = 2) -> list:
             buffer.append(para)
 
     if buffer:
-        sub_text = overlap_text + "\n\n".join(buffer)
+        sub_text = (overlap_text + "\n\n".join(buffer)).strip()
         sub = dict(chunk)
-        sub["text"] = sub_text.strip()
+        sub["text"] = sub_text
         sub["metadata"] = dict(chunk["metadata"])
         sub["metadata"]["chunk_id"] = f"{chunk['metadata']['chunk_id']}_{idx}"
-        sub["metadata"]["token_count_approx"] = token_count(sub["text"])
-        sub["metadata"]["summary"] = extract_summary(sub["text"])
+        sub["metadata"]["token_count_approx"] = token_count(sub_text)
+        sub["metadata"]["summary"] = extract_summary(sub_text)
         sub_chunks.append(sub)
 
     return sub_chunks if sub_chunks else [chunk]
@@ -296,12 +336,14 @@ def parse_api_endpoints(lines: list, file_path: str) -> list:
     current_h2 = ""
     buffer = []
     current_heading = ""
+    current_level = 0  # track whether current buffer was opened by H2 or H3
     idx = 0
 
-    def flush(heading: str, parents: list):
+    def flush():
         nonlocal idx
         if buffer:
-            c = build_chunk(buffer, file_path, "api_endpoint", title, heading, parents, idx)
+            parents = [current_h2] if (current_level == 3 and current_h2) else []
+            c = build_chunk(buffer, file_path, "api_endpoint", title, current_heading, parents, idx)
             chunks.extend(maybe_split_large_chunk(c))
             idx += 1
 
@@ -312,20 +354,22 @@ def parse_api_endpoints(lines: list, file_path: str) -> list:
             if level == 1:
                 continue
             if level == 2:
-                flush(current_heading, [])
+                flush()
                 buffer = [line]
                 current_h2 = text
                 current_heading = text
+                current_level = 2
             elif level == 3:
-                flush(current_heading, [current_h2] if current_h2 else [])
+                flush()
                 buffer = [line]
                 current_heading = text
+                current_level = 3
             else:
                 buffer.append(line)
         else:
             buffer.append(line)
 
-    flush(current_heading, [current_h2] if current_h2 else [])
+    flush()
     return chunks
 
 
@@ -544,7 +588,12 @@ def main():
     ]
     for dt, count in sorted(stats.items()):
         lines.append(f"| `{dt}` | {count} |")
-    lines = lines[:-len(stats)] + ["| doc_type | count |", "|----------|-------|"] + lines[-len(stats):]
+    if stats:
+        lines = lines[:-len(stats)] + ["| doc_type | count |", "|----------|-------|"] + lines[-len(stats):]
+    else:
+        lines.append("| doc_type | count |")
+        lines.append("|----------|-------|")
+        lines.append("| (none) | 0 |")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 

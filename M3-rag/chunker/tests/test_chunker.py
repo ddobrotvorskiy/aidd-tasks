@@ -8,6 +8,8 @@ from chunker import (
     token_count,
     slugify,
     split_sentences,
+    maybe_split_large_chunk,
+    build_chunk,
 )
 
 
@@ -20,8 +22,8 @@ def test_detect_language_russian():
 
 
 def test_detect_language_mixed_mostly_english():
-    # less than 30% cyrillic
-    assert detect_language("Feature: Admin Panel. Назначение: управление.") == "ru"
+    # less than 30% cyrillic — e.g. one Russian word among many English words
+    assert detect_language("The product catalog with search and pagination. Добавить.") == "en"
 
 
 def test_detect_language_mixed_mostly_russian():
@@ -79,3 +81,29 @@ def test_split_sentences_basic():
 
 def test_split_sentences_handles_empty():
     assert split_sentences("") == []
+
+
+def test_maybe_split_large_chunk_adds_suffix():
+    # Build a chunk with ~1000 tokens (4000 chars), split across two paragraphs
+    para = "word " * 400  # ~2000 chars → ~500 tokens each paragraph
+    big_text = para.strip() + "\n\n" + para.strip()
+    chunk = build_chunk(
+        [big_text], "docs/project-data/architecture.md", "generic",
+        "Title", "Section", [], 0
+    )
+    result = maybe_split_large_chunk(chunk)
+    assert len(result) >= 2
+    for r in result:
+        assert "_" in r["metadata"]["chunk_id"].split("__")[-1]  # has suffix
+
+
+def test_maybe_split_large_chunk_small_unchanged():
+    small_text = "Short text."
+    chunk = build_chunk(
+        [small_text], "docs/project-data/architecture.md", "generic",
+        "Title", "Section", [], 0
+    )
+    result = maybe_split_large_chunk(chunk)
+    assert len(result) == 1
+    # chunk_id should NOT have a suffix added
+    assert result[0]["metadata"]["chunk_id"] == chunk["metadata"]["chunk_id"]
