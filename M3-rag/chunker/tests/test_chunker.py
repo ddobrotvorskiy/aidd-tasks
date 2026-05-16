@@ -10,6 +10,13 @@ from chunker import (
     split_sentences,
     maybe_split_large_chunk,
     build_chunk,
+    chunk_file,
+    classify_doc_type,
+    parse_glossary,
+    parse_api_endpoints,
+    parse_features,
+    parse_whole_file,
+    parse_by_h2,
 )
 
 
@@ -107,3 +114,223 @@ def test_maybe_split_large_chunk_small_unchanged():
     assert len(result) == 1
     # chunk_id should NOT have a suffix added
     assert result[0]["metadata"]["chunk_id"] == chunk["metadata"]["chunk_id"]
+
+
+# --- classify_doc_type ---
+
+def test_classify_adr():
+    assert classify_doc_type("docs/project-data/adrs/adr-001-mongodb-vs-postgres.md") == "adr"
+
+def test_classify_incident():
+    assert classify_doc_type("docs/project-data/incidents/i-001-paypal-double-charge.md") == "incident"
+
+def test_classify_glossary():
+    assert classify_doc_type("docs/project-data/glossary.md") == "glossary"
+
+def test_classify_api():
+    assert classify_doc_type("docs/project-data/api/orders.md") == "api_endpoint"
+
+def test_classify_feature():
+    assert classify_doc_type("docs/project-data/features/admin.md") == "feature"
+
+def test_classify_page():
+    assert classify_doc_type("docs/project-data/pages/home.md") == "page"
+
+def test_classify_runbook():
+    assert classify_doc_type("docs/project-data/runbooks/deploy.md") == "runbook"
+
+def test_classify_generic():
+    assert classify_doc_type("docs/project-data/architecture.md") == "generic"
+
+
+# --- parse_whole_file ---
+
+def test_parse_whole_file_single_chunk():
+    lines = ["# ADR-001: Use MongoDB", "", "## Context", "", "We chose MongoDB because..."]
+    chunks = parse_whole_file(lines, "docs/project-data/adrs/adr-001.md", "adr")
+    assert len(chunks) == 1
+    assert chunks[0]["metadata"]["doc_type"] == "adr"
+    assert chunks[0]["metadata"]["title"] == "ADR-001: Use MongoDB"
+    assert "MongoDB" in chunks[0]["text"]
+
+
+def test_parse_whole_file_metadata_fields():
+    lines = ["# My Doc", "", "Some content here."]
+    chunks = parse_whole_file(lines, "docs/project-data/adrs/my-doc.md", "adr")
+    m = chunks[0]["metadata"]
+    assert m["source_file"] == "my-doc.md"
+    assert m["file_path"] == "docs/project-data/adrs/my-doc.md"
+    assert m["language"] in ("en", "ru")
+    assert isinstance(m["keywords"], list)
+    assert isinstance(m["summary"], str)
+    assert isinstance(m["token_count_approx"], int)
+
+
+# --- parse_glossary ---
+
+def test_parse_glossary_one_chunk_per_term():
+    lines = [
+        "# Glossary",
+        "",
+        "## Domain Terms",
+        "",
+        "### Customer",
+        "A user registered in the system.",
+        "",
+        "### Product",
+        "A physical or digital good.",
+    ]
+    chunks = parse_glossary(lines, "docs/project-data/glossary.md")
+    assert len(chunks) == 2
+    headings = [c["metadata"]["section_heading"] for c in chunks]
+    assert "Customer" in headings
+    assert "Product" in headings
+
+
+def test_parse_glossary_parent_heading_is_h2():
+    lines = [
+        "# Glossary",
+        "## Domain Terms",
+        "### Customer",
+        "A user.",
+    ]
+    chunks = parse_glossary(lines, "docs/project-data/glossary.md")
+    assert chunks[0]["metadata"]["parent_headings"] == ["Domain Terms"]
+
+
+# --- parse_api_endpoints ---
+
+def test_parse_api_endpoints_overview_plus_endpoints():
+    lines = [
+        "# Orders API Reference",
+        "",
+        "## Overview",
+        "",
+        "Manages order lifecycle.",
+        "",
+        "## Endpoints",
+        "",
+        "### POST /api/orders",
+        "",
+        "Create a new order.",
+        "",
+        "### GET /api/orders/:id",
+        "",
+        "Get order by id.",
+    ]
+    chunks = parse_api_endpoints(lines, "docs/project-data/api/orders.md")
+    headings = [c["metadata"]["section_heading"] for c in chunks]
+    assert "Overview" in headings
+    assert "POST /api/orders" in headings
+    assert "GET /api/orders/:id" in headings
+
+
+def test_parse_api_endpoints_overview_has_no_parent():
+    lines = [
+        "# Orders API",
+        "## Overview",
+        "Manages order lifecycle.",
+        "## Endpoints",
+        "### POST /api/orders",
+        "Create order.",
+    ]
+    chunks = parse_api_endpoints(lines, "docs/project-data/api/orders.md")
+    overview_chunk = next(c for c in chunks if c["metadata"]["section_heading"] == "Overview")
+    assert overview_chunk["metadata"]["parent_headings"] == []
+
+
+def test_parse_api_endpoints_endpoint_has_h2_parent():
+    lines = [
+        "# Orders API",
+        "## Endpoints",
+        "### POST /api/orders",
+        "Create order.",
+    ]
+    chunks = parse_api_endpoints(lines, "docs/project-data/api/orders.md")
+    endpoint_chunk = next(c for c in chunks if c["metadata"]["section_heading"] == "POST /api/orders")
+    assert "Endpoints" in endpoint_chunk["metadata"]["parent_headings"]
+
+
+# --- parse_features ---
+
+def test_parse_features_one_chunk_per_h2():
+    lines = [
+        "# Admin Features",
+        "",
+        "## Feature 1: Admin Navigation",
+        "",
+        "Controls admin menu visibility.",
+        "",
+        "## Feature 2: Admin Product List",
+        "",
+        "Table of all products.",
+    ]
+    chunks = parse_features(lines, "docs/project-data/features/admin.md")
+    headings = [c["metadata"]["section_heading"] for c in chunks]
+    assert "Feature 1: Admin Navigation" in headings
+    assert "Feature 2: Admin Product List" in headings
+
+
+def test_parse_features_large_feature_splits_at_h3():
+    # A feature > 600 tokens should split at H3 boundaries
+    # token_count = len(text) // 4; "word " = 5 chars → 300 reps = 375 tokens each,
+    # combined ~760 tokens total which exceeds the 600-token threshold
+    big_para = "word " * 300
+    lines = [
+        "# Features",
+        "## Feature 1: Big Feature",
+        "### Section A",
+        big_para,
+        "### Section B",
+        big_para,
+    ]
+    chunks = parse_features(lines, "docs/project-data/features/admin.md")
+    # Should have produced at least 2 chunks (one per H3)
+    assert len(chunks) >= 2
+
+
+# --- parse_by_h2 (generic / runbook) ---
+
+def test_parse_by_h2_sections():
+    lines = [
+        "# Architecture",
+        "",
+        "## 1. System Overview",
+        "",
+        "ProShop is a MERN app.",
+        "",
+        "## 2. Tech Stack",
+        "",
+        "Node, Express, React, MongoDB.",
+    ]
+    chunks = parse_by_h2(lines, "docs/project-data/architecture.md", "generic")
+    headings = [c["metadata"]["section_heading"] for c in chunks]
+    assert "1. System Overview" in headings
+    assert "2. Tech Stack" in headings
+
+
+def test_parse_by_h2_h3_split_when_large():
+    # Build a section >600 tokens with H3 sub-sections
+    # token_count = len(text) // 4; "word " = 5 chars → 300 reps = 375 tokens each,
+    # combined ~760 tokens total which exceeds the 600-token threshold
+    big_para = "word " * 300
+    lines = [
+        "# Doc",
+        "## Big Section",
+        "### Sub A",
+        big_para,
+        "### Sub B",
+        big_para,
+    ]
+    chunks = parse_by_h2(lines, "docs/project-data/architecture.md", "generic")
+    # Should have split into at least 2 chunks
+    assert len(chunks) >= 2
+
+
+# --- INDEX.md skipped ---
+
+def test_index_md_skipped(tmp_path):
+    index = tmp_path / "INDEX.md"
+    index.write_text("# Index\n\nSome content.\n")
+    chunks = chunk_file(str(index), str(tmp_path))
+    assert chunks == []
