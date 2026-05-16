@@ -549,8 +549,12 @@ def find_md_files(root: str) -> list:
 
 
 def main():
-    script_dir = Path(__file__).parent
-    project_root = script_dir.parent.parent  # M3-rag/chunker/ -> aidd-tasks/
+    script_dir = Path(__file__).resolve().parent
+    # script is at aidd-tasks/M3-rag/chunker/chunker.py
+    # .parent      = aidd-tasks/M3-rag/chunker
+    # .parent.parent     = aidd-tasks/M3-rag
+    # .parent.parent.parent = aidd-tasks/  <-- project root
+    project_root = script_dir.parent.parent  # M3-rag/chunker/ -> M3-rag/ -> aidd-tasks/
     data_dir = project_root / "docs" / "project-data"
     output_path = project_root / "M3-rag" / "chunks.jsonl"
     report_path = project_root / "M3-rag" / "report.md"
