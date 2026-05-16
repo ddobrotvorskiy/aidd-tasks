@@ -518,17 +518,20 @@ def chunk_file(file_path: str, project_root: str) -> list:
     doc_type = classify_doc_type(rel)
 
     if doc_type in ("adr", "incident", "page"):
-        return parse_whole_file(lines, rel, doc_type)
+        chunks = parse_whole_file(lines, rel, doc_type)
     elif doc_type == "glossary":
-        return parse_glossary(lines, rel)
+        chunks = parse_glossary(lines, rel)
     elif doc_type == "api_endpoint":
-        return parse_api_endpoints(lines, rel)
+        chunks = parse_api_endpoints(lines, rel)
     elif doc_type == "feature":
-        return parse_features(lines, rel)
+        chunks = parse_features(lines, rel)
     elif doc_type in ("runbook", "generic"):
-        return parse_by_h2(lines, rel, doc_type)
+        chunks = parse_by_h2(lines, rel, doc_type)
     else:
-        return parse_whole_file(lines, rel, doc_type)
+        chunks = parse_whole_file(lines, rel, doc_type)
+
+    # Drop chunks whose text is empty or too short to have a non-zero token count
+    return [c for c in chunks if c["text"].strip() and c["metadata"]["token_count_approx"] > 0]
 
 
 # ---------------------------------------------------------------------------

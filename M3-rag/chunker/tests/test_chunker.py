@@ -334,3 +334,57 @@ def test_index_md_skipped(tmp_path):
     index.write_text("# Index\n\nSome content.\n")
     chunks = chunk_file(str(index), str(tmp_path))
     assert chunks == []
+
+
+import json
+from pathlib import Path
+
+def test_integration_real_files():
+    """Smoke test: chunk all real docs/project-data files and validate output shape."""
+    project_root = Path(__file__).parent.parent.parent.parent  # aidd-tasks/
+    data_dir = project_root / "docs" / "project-data"
+
+    if not data_dir.exists():
+        import pytest
+        pytest.skip("docs/project-data not present — run Task 1 first")
+
+    from chunker import find_md_files, chunk_file
+
+    md_files = find_md_files(str(data_dir))
+    assert len(md_files) >= 46, f"Expected >=46 .md files, got {len(md_files)}"
+
+    all_chunks = []
+    for fpath in md_files:
+        chunks = chunk_file(fpath, str(project_root))
+        all_chunks.extend(chunks)
+
+    assert len(all_chunks) > 50, f"Expected >50 chunks, got {len(all_chunks)}"
+
+    # Every chunk must have required fields
+    required_fields = {
+        "chunk_id", "source_file", "file_path", "doc_type",
+        "title", "section_heading", "parent_headings",
+        "language", "keywords", "summary", "token_count_approx"
+    }
+    for c in all_chunks:
+        assert "text" in c, f"Missing 'text' in chunk {c}"
+        assert "metadata" in c, f"Missing 'metadata' in chunk {c}"
+        missing = required_fields - set(c["metadata"].keys())
+        assert not missing, f"Missing metadata fields {missing} in chunk {c['metadata']['chunk_id']}"
+        assert c["metadata"]["language"] in ("en", "ru")
+        assert isinstance(c["metadata"]["keywords"], list)
+        assert len(c["metadata"]["keywords"]) <= 8
+        assert isinstance(c["metadata"]["token_count_approx"], int)
+        assert c["metadata"]["token_count_approx"] > 0
+
+    # No chunk IDs duplicated
+    ids = [c["metadata"]["chunk_id"] for c in all_chunks]
+    assert len(ids) == len(set(ids)), "Duplicate chunk_ids found"
+
+    # All chunk texts are non-empty
+    for c in all_chunks:
+        assert c["text"].strip(), f"Empty text in chunk {c['metadata']['chunk_id']}"
+
+    # Verify INDEX.md produced no chunks
+    index_chunks = [c for c in all_chunks if c["metadata"]["source_file"] == "INDEX.md"]
+    assert index_chunks == [], "INDEX.md should produce no chunks"
